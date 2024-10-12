@@ -1,2 +1,2 @@
 # -Linux-
-赵炯老师《linux-0.12 内核完全剖析》读书笔记及linux-0.12注释源码
+MIT Operating System Engineering课堂笔记，浅浅的记录一下学习过程
