@@ -15,7 +15,7 @@ int sum_to(int n){
 }
 ```
 上边的c语言代码对应的汇编如下面这样
-```assembly
+```s
 sum_to:
     mv t0,a0        # t0 <- a0
     li a0,0         # a0 <- 0
@@ -133,7 +133,7 @@ loop:
   + 所以通常，在汇编代码中，函数的最开始你们可以看到Function prologue，之后是函数的本体，最后是Epilogue
 ----------
 + 再回到汇编本身
-```assembly
+```s
 sum_to:
     mv t0,a0        # t0 <- a0
     li a0,0         # a0 <- 0
