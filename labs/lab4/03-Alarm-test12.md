@@ -113,7 +113,6 @@ switchTrapframe(struct trapframe* tf, struct trapframe* tfs)
 ### 第五步：完善usertrap函数
 <img src=".\picture\image14.png">
 
-
 ### 第六步：修改sys_sigreturn
 ```c
 uint64
@@ -124,3 +123,6 @@ sys_sigreturn(void){
   return 0;
 }
 ```
+
+## 测试
+<img src=".\picture\image17.png">
