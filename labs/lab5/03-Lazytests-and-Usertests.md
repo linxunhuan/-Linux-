@@ -13,100 +13,178 @@
 <img src=".\picture\image3.png">
 
 ## 解题步骤
-### 第一步：处理sbrk()负参数
-+ 该函数用于改变当前进程的数据段大小
-  + 负参数，意味着减少内存
-  + 正参数，意味着增大内存
+
++ 这里要很惭愧的说，经过多个尝试，前面写的那些自以为能绕开报错的，终究还是在这个时候要全部解决掉
++ 这个实验，三个片段其实是一个需求的分三步体现，放在一起看，才能达到需求，所以下面将是若会贯通的解释该如何解决
+
+### 第一步：修改 sys_sbrk,只修改 p->sz 的值而不分配物理内存
 ```c
 uint64
 sys_sbrk(void)
 {
-  int addr; // 存储当前数据段的末尾地址（也即旧的进程大小）
-  int n;    // 表示要增加或减少的数据段大小
-  struct proc *p = myproc();
+  int addr;
+  int n;
 
-  
+  struct proc* p = myproc();
+
   if(argint(0, &n) < 0)
     return -1;
-  
-  // 保存当前数据段末尾地址（即当前的进程大小）。
-  addr = p->sz;
-  
-  // 根据用户传入的大小 n 进行处理：
-  if(n > 0){
-    // 如果 n 大于 0，则意味着需要扩展数据段
-    p->sz += n;
-  }else if (n < 0){
-    // 如果 n 小于 0，则意味着需要缩小数据段
-    p ->sz = uvmdealloc(p->pagetable,p->sz,p->sz+n);
+  addr = p -> sz;
+
+  // 这是释放内存
+  if(n < 0){
+    uvmdealloc(p -> pagetable,p ->sz,p -> sz + n);
   }
-  
+
+  // lazy allocation
+  p -> sz += n;
   return addr;
 }
 ```
-### 第二步：如果page-faults的虚拟内存地址比sbrk()分配的大，则杀掉此进程
+### 第二步：修改 usertrap 用户态 trap 处理函数
++ 如果为缺页异常((r_scause() == 13 || r_scause() == 15))
++ 且发生异常的地址是因为lazy allocation而没有映射的话
+  + 就为其分配物理内存，并在页表建立映射：
++ 但在建立页表的时候，需要判断是否符合要求，符合才分配：
+  + 处于 [0, p->sz)地址范围之中（进程申请的内存范围）
+  + PGROUNDDOWN(va) 将地址向下舍入到页面边界的时候
+    + 栈页的低一页故意留成不映射，作为哨兵用于捕捉 stack overflow 错误
+  + 该虚拟地址的页表项（PTE）是否有效
++ 既然加函数了，记得去defs.h文件中声明，这里我自己懒了
 ```c
-else if(r_scause() == 15 || r_scause() == 13) {
+// usertrap()
+ else if (r_scause() == 13 || r_scause() == 15) {
     
     // r_stval()返回 RISC-V stval寄存器，其中包含导致页面错误的虚拟地址
     uint64 va = r_stval();
-
-    // * 如果虚拟内存地址高于使用sbrk分配的任何虚拟地址，则终止该进程
-    if (va >= p->sz) {  
-       p->killed = 1;
-     }else if (va < PGROUNDDOWN(p->trapframe->sp)){
-      p->killed = 1;
-     }else{
-      char *mem = kalloc();
-      
-      // 将分配的物理内存清零，确保新页面的内容初始化为 0
-      memset(mem,0, PGSIZE);
-      
-      // 将虚拟地址映射到物理地址，并更新进程的页表
-      // PGROUNDDOWN(stval) 将 stval 向下取整到页面边界（4KB 对齐的地址）
-      if(mappages(p->pagetable, PGROUNDDOWN(va),PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U) != 0){
-        kfree(mem);
-        p -> killed = 1;
-      }
-     }
-}
-```
-### 第三步：处理fork() parent-to-child内存拷贝
-+ 经查看fork()函数，确定，具体执行由uvmcopy()函数解决
-+ 需要处理的两个问题（也就是4和5），仔细检查发现，就是源代码自己panic点
-+ 那屏蔽点，省心
-```c
-int
-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
-{
-  pte_t *pte;
-  uint64 pa, i;
-  uint flags;
-  char *mem;
-
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      continue;// panic("uvmcopy: pte should exist");
-    if((*pte & PTE_V) == 0)
-      continue;// panic("uvmcopy: page not present");
-    pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+    if(uvmjudge(va)){
+      uvmlazytouch(va);
     }
   }
-  return 0;
+```
+```c
+int
+uvmjudge(uint64 va){
+  
+  struct proc *p = myproc();
 
- err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
-  return -1;
+  // 遍历当前进程的页表，找到与虚拟地址 va 对应的页表项
+  pte_t *pte = walk(p ->pagetable, va, 0);
+
+  return va < p ->sz 
+    && PGROUNDDOWN(va) != r_sp()
+    && (p == 0 || ((*pte & PTE_V) == 0));
+}
+
+void
+uvmlazytouch(uint64 va){
+  struct proc *p = myproc();
+
+  // 分配物理内存页
+  char *mem = kalloc();
+
+  if (mem == 0){
+    p -> killed = 1;
+  }else{
+
+    // 如果分配成功，则用零初始化分配的内存
+    memset(mem, 0, PGSIZE);
+
+    // 尝试将分配的物理内存映射到指定的虚拟地址 (va) 
+    if(mappages(p -> pagetable, va, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+      kfree(mem);
+      p -> killed = 1;
+    }
+  }
 }
 ```
-### 第四步：处理用户堆栈下无效页面的故障
+### 第三步：该偷的懒还是要偷的
++ 由于lazy allocation分配的页，在刚分配的时候是没有对应的映射的
+  + 所以要把一些原本在遇到无映射地址时会 panic 的函数的行为
+    + 直接忽略这样的地址
+```c
+// 取消虚拟地址映射
+void
+uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if((va % PGSIZE) != 0)
+    panic("uvmunmap: not aligned");
+
+  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+    if((pte = walk(pagetable, a, 0)) == 0)
+      //panic("uvmunmap: walk");
+      continue;
+    if((*pte & PTE_V) == 0)
+      //panic("uvmunmap: not mapped");
+      continue;
+    if(PTE_FLAGS(*pte) == PTE_V)
+      //panic("uvmunmap: not a leaf");、
+      continue;
+    if(do_free){
+      uint64 pa = PTE2PA(*pte);
+      kfree((void*)pa);
+    }
+    *pte = 0;
+  }
+}
+```
+### 第四步：copyin() 和 copyout()函数的修改
++ copyin() 和 copyout()：内核/用户态之间互相拷贝数据
++ 这里会访问到lazy allocation分配但是还没实际分配的页
+  + 所以要加一个检测，确保 copy 之前，用户态地址对应的页都有被实际分配和映射
+```c
+int
+copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+{
+  uint64 n, va0, pa0;
+
+  if(uvmjudge(dst))
+    uvmlazytouch(dst);
+
+  // .......
+}
+int
+copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+{
+  uint64 n, va0, pa0;
+  if(uvmjudge(dst))
+    uvmlazytouch(dst);
+  // ....
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
