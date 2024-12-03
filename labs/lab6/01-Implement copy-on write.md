@@ -89,41 +89,290 @@ $
 + 如果出现COW页面错误并且没有可用内存，则应终止进程
 
 ## 解题思路
-### 第一步：定义变量，标示一个映射对应的物理页是否是lazy allocation页
-+ 源代码这里写了，8、9、10位是保留的，我们可以自行使用
-+ 但是8，题目自己又用过了，所以咱们用9
+### 第一步：设置标记位
++ 在risc.h中设置
 ```c
 #define PTE_COW (1L << 9) // 记录应用了COW策略后fork的页面
 ```
-### 第二步：在kalloc.c中进行修改
-+ 定义引用计数的全局变量ref
-  + 其中包含
-    + 一个自旋锁
-    + 一个引用计数数组
-  + 由于ref是全局变量，会被自动初始化为全0
-+ 这里使用自旋锁是考虑到这种情况：
-  + 进程P1和P2共用内存M,M引用计数为2
-  + 此时CPU1要执行fork产生P1的子进程，CPU2要终止P2
-  + 那么假设两个CPU同时读取引用计数为2，执行完成后CPU1中保存的引用计数为3，CPU2保存的计数为1，那么后赋值的语句会覆盖掉先赋值的语句，从而产生错误
+### 第二步：修改 uvmcopy()
++ 修改成：不要立即分配子进程的内存（把映射map到物理内存）
++ 而是只修改PTE_W和PTE_COW
+  + 父、子进程均不可写——PTE_W
+  + PTE_COW将这一页改为COW页（子进程）
++ 修改如下
 ```c
-struct ref_stru{
-  struct spinlock lock;     // 自旋锁
-  int cnt[PHYSTOP / PGSIZE];// 存储物理页面的引用计数
-}ref;
+int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+{
+  pte_t *pte;        // 存储页表项的指针
+  uint64 pa, i;      // pa是物理地址，i是循环变量
+  uint flags;        // 页表项的标志位
+  
+
+  for(i = 0; i < sz; i += PGSIZE){
+
+    if((pte = walk(old, i, 0)) == 0)
+      panic("uvmcopy: pte should exist"); 
+    if((*pte & PTE_V) == 0)
+      panic("uvmcopy: page not present");  
+
+    // 获取该页表项对应的物理地址
+    pa = PTE2PA(*pte);
+    
+    // 获取页表项的标志位（包括访问权限等）
+    flags = PTE_FLAGS(*pte);
+    
+    // 不分配内存，而是设置标记
+    if (flags & PTE_W){
+      flags = (flags | PTE_COW) & (~PTE_W);
+      *pte = PA2PTE(pa) | flags;
+    }
+
+    increase_count((void *)pa);// 增加计数
+
+    // 将物理页面映射到新页表（新进程的地址空间）
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      goto err;
+    }
+  }
+
+  return 0;
+
+ err:
+  uvmunmap(new, 0, i / PGSIZE, 1);
+  return -1; 
+}
 ```
-+ 初始化自旋锁
+### 第三步：修改usertrap()以识别页面错误
++ 修改trap.c中的usertrap() 函数
++ 利用trap机制来处理这个缺页中断（类似于实验五）
+  + 判断有缺页中断，就先判断一下当前地址是否有效
+    + （报错的虚拟地址超过最大的虚拟地址，或者访问的是每个进程的guard page）
+  + 然后给有COW标志位的页表进行副本copy
+  + 然后设置为可写
 ```c
+ else if (r_scause() == 13 ||r_scause() == 15) {
+    uint64 va = r_stval();
+
+    // 保证当前页地址有效
+    if(va >= MAXVA ||
+    (va <= PGROUNDDOWN(p ->trapframe->sp)
+    && va >= PGROUNDDOWN(p ->trapframe->sp) - PGSIZE)){
+      p -> killed = 1;
+    }else if(uvmcowcopy(p -> pagetable,va) != 0){
+      // 判断页是否是cow页，并且为其实际分配内存
+      p -> killed = 1;
+    }
+  }
+```
+### 第四步：当COW页面出现页面错误时，使用kalloc()分配一个新页面
++ 这里就是对应上一步里面的uvmcopy()函数的
+```c
+int
+uvmcowcopy(pagetable_t pagetable, uint64 va){
+  uint64 pa;  // 物理地址
+  pte_t* pte; // 页表项指针
+  uint flags; // 页表项标志位
+
+  // 如果虚拟地址超出了最大虚拟地址范围，则返回错误
+  if (va >= MAXVA) return -1;
+
+  va = PGROUNDDOWN(va);
+
+  pte = walk(pagetable, va, 0);
+  if (pte == 0) return -1;
+
+  pa = PTE2PA(*pte);
+  if (pa == 0) return -1;
+
+  flags = PTE_FLAGS(*pte);
+
+  // 判断是不是cow页
+  if(flags & PTE_COW){
+    char *ka = kalloc();
+
+    // 源物理页数据拷贝到新的内核空间
+    memmove(ka, (char*)pa, PGSIZE);
+
+    // 去除 COW 标志并设置为可写（PTE_W）
+    flags = (flags & ~PTE_COW) | PTE_W;
+    *pte = PA2PTE(pa) | flags;
+
+    kfree((void*)pa);
+  }
+  return 0;
+}
+```
+### 第五步：设置引用计数
++ 仿照kmem写
++ 题目中的提示：
+      + 可以将这些计数保存在一个固定大小的整型数组中
+      + 你必须制定一个如何索引数组以及如何选择数组大小的方案
+        + 例如，您可以用页的物理地址除以4096对数组进行索引
++ 在kalloc.c中
+```c
+// 将一个物理地址（pa）转换为一个索引值
+// 将地址右移12位，相当于将地址除以页面大小（PGSIZE），因为 PGSIZE 为 4KB，即 2^12 字节
+#define PA2IDX(pa) (((uint64)pa) >> 12)
+
+struct
+{
+  struct spinlock lock;                    // 一个自旋锁，确保在多核处理器上访问引用计数时的同步
+  int count[PGROUNDUP(PHYSTOP) / PGSIZE];  // 用于存储每个页面的引用计数
+} mem_ref;
+
+void
+increase_rc(void *pa)
+{
+  acquire(&mem_ref.lock);       // 获取锁
+  mem_ref.count[PA2IDX(pa)]++;  // 将对应页面的引用计数加1
+  release(&mem_ref.lock);       // 释放锁
+}
+
+void
+decrease_rc(void *pa)
+{
+  acquire(&mem_ref.lock);       // 获取锁
+  mem_ref.count[PA2IDX(pa)]--;  // 将对应页面的引用计数减1
+  release(&mem_ref.lock);       // 释放锁
+}
+
+int 
+get_rc(void *pa){
+  acquire(&mem_ref.lock);              // 获取锁
+  int rc = mem_ref.count[PA2IDX(pa)];  // 获取对应页面的引用计数
+  release(&mem_ref.lock);              // 释放锁
+  return rc;  
+}
+
 void
 kinit()
 {
-  initlock(&pa_ref_lock, "pa_ref_lock");
-  memset(pa_ref_count, 0x3f, sizeof pa_ref_count);
+  initlock(&mem_ref.lock,"mem_ref");  // 初始化锁
+  acquire(&kmem.lock);                // 获取内存管理锁
+
+  // 将计数都初始化为0
+  for(int i=0; i < PGROUNDUP(PHYSTOP)/ PGSIZE; i++)
+    mem_ref.count[i] = 0; // 初始化所有页面引用计数为0
+  
+  release(&kmem.lock);  // 释放内存管理锁  
   initlock(&kmem.lock, "kmem");
-  initlock(&ref.lock, "ref");
   freerange(end, (void*)PHYSTOP);
 }
 ```
+### 第六步：设置kfree()函数
++ 在释放页面时，需要考虑这个界面的使用计数是否为0
++ 每次访问kfree时，就将这个计数减一，如果为0，就直接彻底free掉就行
+```c
+void
+kfree(void *pa){
+  struct run *r;
 
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    panic("kfree");
+
+  decrease_rc(pa);
+  if (get_rc(pa) > 0)
+    return;
+  
+   // 如果引用计数已经是 0，说明没有其他地方再使用这个页面了，准备释放它
+  memset(pa, 0, PGSIZE);
+  r = (struct run*)pa;
+  acquire(&kmem.lock);
+  
+  // 将释放的页面添加到内存空闲链表中
+  r->next = kmem.freelist;  // 将当前页面插入到空闲链表的头部
+  kmem.freelist = r;        // 更新空闲链表头指针为新的页面
+
+  release(&kmem.lock);
+}
+```
+
+### 第七步：每当给COW页分配内存时，就需要增加一个计数
++ 这里是void * ，是因为defs里面声明的，就是void *
+```c
+void*
+kalloc(void){
+  struct run *r;
+
+  // 加锁，确保在访问共享资源 kmem.freelist 时的线程安全
+  acquire(&kmem.lock);
+  r = kmem.freelist;
+  if(r)
+    kmem.freelist = r->next;
+  release(&kmem.lock);
+
+  if(r)
+    memset((char*)r, 5, PGSIZE);
+    increase_rc((void*)r);
+  
+  return (void*)r;
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```c
+void *
+kalloc(void)
+{
+  struct run *r;  
+
+  // 获取 kmem 锁，确保在访问内存池时的同步操作
+  acquire(&kmem.lock);  
+
+   // 获取当前空闲内存块链表的头指针（freelist）。此时 r 指向一个空闲内存块
+  r = kmem.freelist; 
+  
+  if(r)
+  // 如果 freelist 非空，将 freelist 更新为下一个空闲块，即 r->next
+    kmem.freelist = r->next; 
+  release(&kmem.lock);  // 释放 kmem 锁，完成对内存池的访问。
+
+  if(r)
+    memset((char*)r, 5, PGSIZE); 
+// 如果 r 非空，表示成功获取到一块内存。用 `memset` 将这块内存填充为值 5（表示“垃圾”数据）
+//（`PGSIZE` 是每页的大小通常是 4KB 或 4096 字节）
+  
+  if(r) {
+    //acquire(&pa_ref_lock);  
+     // 对物理页的引用计数加 1
+     // 这里通过将指针 r 转换为物理地址并右移 12 位来计算物理页号
+     // 假设页大小为 4KB，即 12 位移位。
+     pa_ref_count[(uint32)(uint64)r >> 12]++; 
+    //release(&pa_ref_lock);  
+  }
+
+  return (void*)r;  // 返回指向分配内存块的指针 r。
+}
+```
 
 
 
