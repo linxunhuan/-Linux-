@@ -289,30 +289,217 @@ uartintr(void)
 ```
 + 所以，在XV6中，驱动的bottom部分（注，也就是中断处理程序）和驱动的up部分（注，uartputc函数）可以完全的并行运行，所以中断处理程序也需要获取锁
 ##  自旋锁（Spin lock）的实现
-+ 接下来我们看一下如何实现自旋锁。锁的特性就是只有一个进程可以获取锁，在任何时间点都不能有超过一个锁的持有者。我们接下来看一下锁是如何确保这里的特性。
++ 锁的特性就是只有一个进程可以获取锁，在任何时间点都不能有超过一个锁的持有者
+----------------------------------------------------------
++ 我们先来看一个有问题的锁的实现，这样我们才能更好的理解这里的挑战是什么
+  + 实现锁的主要难点在于锁的acquire接口
+  + 在acquire里面有一个死循环
+  + 循环中判断锁对象的locked字段是否为0
+    + 如果为0那表明当前锁没有持有者
+  + 当前对于acquire的调用可以获取锁
+  + 之后我们通过设置锁对象的locked字段为1来获取锁
++ 如果锁的locked字段不为0，那么当前对于acquire的调用就不能获取锁，程序会一直spin
+  + 也就是说，程序在循环中不停的重复执行，直到锁的持有者调用了release并将锁对象的locked设置为0
++ 上述实现方法带来的挑战：
+  + 如果CPU0和CPU1同时到达A语句，它们会同时看到锁的locked字段为0，之后它们会同时走到B语句，这样它们都acquire了锁
+  + 这样我们就违背了锁的特性
++ 最常见的方法是依赖于一个特殊的硬件指令：
+  + 这个特殊的硬件指令会保证一次test-and-set操作的原子性
+  + 在RISC-V上，这个特殊的指令就是amoswap（atomic memory swap）
+  + 这个指令接收3个参数，分别是address，寄存器r1，寄存器r2
+  + 这条指令会先锁定住address，将address中的数据保存在一个临时变量中（tmp）
+  + 之后将r1中的数据写入到地址中，之后再将保存在临时变量中的数据写入到r2中，最后再对于地址解锁
++ 通过这里的加锁，可以确保address中的数据存放于r2，而r1中的数据存放于address中
+  + 大多数的处理器都有这样的硬件指令，因为这是一个实现锁的方便的方式
+  + 这里我们通过将一个软件锁转变为硬件锁最终实现了原子性
+  + 不同处理器的具体实现可能会非常不一样，处理器的指令集通常像是一个说明文档，它不会有具体实现的细节，具体的实现依赖于内存系统是如何工作的，比如说：
+    + 多个处理器共用一个内存控制器，内存控制器可以支持这里的操作
+      + 比如给一个特定的地址加锁，然后让一个处理器执行2-3个指令，然后再解锁
+      + 因为所有的处理器都需要通过这里的内存控制器完成读写，所以内存控制器可以对操作进行排序和加锁
+    + 如果内存位于一个共享的总线上，那么需要总线控制器（bus arbiter）来支持
+      + 总线控制器需要以原子的方式执行多个内存操作
+    + 如果处理器有缓存
+      + 那么缓存一致性协议会确保对于持有了我们想要更新的数据的cache line只有一个写入者，相应的处理器会对cache line加锁，完成两个操作
++ 硬件原子操作的实现可以有很多种方法
+  + 但是基本上都是对于地址加锁，读出数据，写入新数据，然后再返回旧数据
+--------------------------------------------
++ XV6中的acquire和release的实现
+```c
+// Mutual exclusion lock.
+struct spinlock {
+  uint locked;       // Is the lock held?
 
-我们先来看一个有问题的锁的实现，这样我们才能更好的理解这里的挑战是什么。实现锁的主要难点在于锁的acquire接口，在acquire里面有一个死循环，循环中判断锁对象的locked字段是否为0，如果为0那表明当前锁没有持有者，当前对于acquire的调用可以获取锁。之后我们通过设置锁对象的locked字段为1来获取锁。最后返回。
+  // For debugging:
+  char *name;        // Name of lock.
+  struct cpu *cpu;   // The cpu holding the lock.
+};
+```
+```c
+// Acquire the lock.
+// Loops (spins) until the lock is acquired.
+void
+acquire(struct spinlock *lk)
+{
+  push_off(); // disable interrupts to avoid deadlock.
+  if(holding(lk))
+    panic("acquire");
 
+  // On RISC-V, sync_lock_test_and_set turns into an atomic swap:
+  //   a5 = 1
+  //   s1 = &lk->locked
+  //   amoswap.w.aq a5, a5, (s1)
+  while(__sync_lock_test_and_set(&lk->locked, 1) != 0)
+    ;
 
+  // Tell the C compiler and the processor to not move loads or stores
+  // past this point, to ensure that the critical section's memory
+  // references happen strictly after the lock is acquired.
+  // On RISC-V, this emits a fence instruction.
+  __sync_synchronize();
 
-如果锁的locked字段不为0，那么当前对于acquire的调用就不能获取锁，程序会一直spin。也就是说，程序在循环中不停的重复执行，直到锁的持有者调用了release并将锁对象的locked设置为0。
+  // Record info about lock acquisition for holding() and debugging.
+  lk->cpu = mycpu();
+}
+```
++ 在函数中有一个while循环，这就是我刚刚提到的test-and-set循环
++ 实际上C的标准库已经定义了这些原子操作
+  + C标准库中已经有一个函数__sync_lock_test_and_set
+  + 因为大部分处理器都有的test-and-set硬件指令，所以这个函数的实现比较直观
+  + 我们可以通过查看kernel.asm来了解RISC-V具体是如何实现的
+  + 下图就是atomic swap操作
+```s
+while(__sync_lock_test_and_set(&lk->locked, 1) != 0)
+    80000c16:	87ba                	mv	a5,a4
+    80000c18:	0cf4a7af          	amoswap.w.aq	a5,a5,(s1)
+    80000c1c:	2781                	sext.w	a5,a5
+    80000c1e:	ffe5                	bnez	a5,80000c16 <acquire+0x22>
+```
++ 这里比较复杂，总的来说，一种情况下我们跳出循环，另一种情况我们继续执行循环
++ C代码就要简单的多
+  + 如果锁没有被持有，那么锁对象的locked字段会是0
+    + 如果locked字段等于0，我们调用test-and-set将1写入locked字段，并且返回locked字段之前的数值0
+    + 如果返回0，那么意味着没有人持有锁，循环结束
+  + 如果locked字段之前是1，那么这里的流程是
+    + 先将之前的1读出，然后写入一个新的1
+    + 但是这不会改变任何数据，因为locked之前已经是1了
+    + 之后__sync_lock_test_and_set会返回1，表明锁之前已经被人持有了，这样的话，判断语句不成立，程序会持续循环（spin），直到锁的locked字段被设置回0
++ 接下来我们看一下release的实现，首先看一下kernel.asm中的指令
+```s
+  __sync_lock_release(&lk->locked);
+    80000cc6:	0f50000f          	fence	iorw,ow
+    80000cca:	0804a02f          	amoswap.w	zero,zero,(s1)
+```
++ 可以看出release也使用了atomic swap操作，将0写入到了s1
++ 下面是对应的C代码，它基本确保了将lk->locked中写入0是一个原子操作
+```c
+// Release the lock.
+void
+release(struct spinlock *lk)
+{
+  if(!holding(lk))
+    panic("release");
 
-在这个实现里面会有什么样的问题
+  lk->cpu = 0;
 
+  // Tell the C compiler and the CPU to not move loads or stores
+  // past this point, to ensure that all the stores in the critical
+  // section are visible to other CPUs before the lock is released,
+  // and that loads in the critical section occur strictly before
+  // the lock is released.
+  // On RISC-V, this emits a fence instruction.
+  __sync_synchronize();
 
+  // Release the lock, equivalent to lk->locked = 0.
+  // This code doesn't use a C assignment, since the C standard
+  // implies that an assignment might be implemented with
+  // multiple store instructions.
+  // On RISC-V, sync_lock_release turns into an atomic swap:
+  //   s1 = &lk->locked
+  //   amoswap.w zero, zero, (s1)
+  __sync_lock_release(&lk->locked);
 
+  pop_off();
+}
+```
+---------------------------------------
++ 为什么release函数中不直接使用一个store指令将锁的locked字段写为0
+  + 可能有两个处理器或者两个CPU同时在向locked字段写入数据
+  + 这里的问题是，**store指令不是一个原子操作**，这取决于具体的实现
+    + 例如，对于CPU内的缓存，每一个cache line的大小可能大于一个整数
+    + 那么store指令实际的过程将会是：
+      + 首先会加载cache line，之后再更新cache line
+      + 所以对于store指令来说，里面包含了两个微指令
+      + 这样的话就有可能得到错误的结果
+  + 所以为了避免理解硬件实现的所有细节，例如整数操作不是原子的，或者向一个64bit的内存值写数据是不是原子的
+  + 我们直接使用一个RISC-V提供的确保原子性的指令来将locked字段写为0
+------------------------------------------
++ 在acquire函数的最开始，会先关闭中断
++ 我们先来假设acquire在一开始并没有关闭中断
+  + 在uartputc函数中，首先会acquire锁
+  + 如果不关闭中断会发生什么呢？
+```c
+// add a character to the output buffer and tell the
+// UART to start sending if it isn't already.
+// blocks if the output buffer is full.
+// because it may block, it can't be called
+// from interrupts; it's only suitable for use
+// by write().
+void
+uartputc(int c)
+{
+  acquire(&uart_tx_lock);
 
+  if(panicked){
+    for(;;)
+      ;
+  }
 
-
-
-
-
-
-
-
-
-
-
+  while(1){
+    if(((uart_tx_w + 1) % UART_TX_BUF_SIZE) == uart_tx_r){
+      // buffer is full.
+      // wait for uartstart() to open up space in the buffer.
+      sleep(&uart_tx_r, &uart_tx_lock);
+    } else {
+      uart_tx_buf[uart_tx_w] = c;
+      uart_tx_w = (uart_tx_w + 1) % UART_TX_BUF_SIZE;
+      uartstart();
+      release(&uart_tx_lock);
+      return;
+    }
+  }
+}
+```
++ uartputc函数会acquire锁，UART本质上就是传输字符
++ 当UART完成了字符传输会产生一个中断之后会运行uartintr函数，在uartintr函数中，会获取同一把锁，但是这把锁正在被uartputc持有
++ 如果这里只有一个CPU的话，那这里就是死锁
++ 中断处理程序uartintr函数会一直等待锁释放，但是CPU不出让给uartputc执行的话锁又不会释放
++ 在XV6中，这样的场景会触发panic，因为同一个CPU会再次尝试acquire同一个锁
++ 所以spinlock需要处理两类并发
+  + 一类是不同CPU之间的并发
+  + 一类是相同CPU上中断和普通程序之间的并发
++ 针对后一种情况，我们需要在acquire中关闭中断
+  + 中断会在release的结束位置再次打开
+  + 因为在这个位置才能再次安全的接收中断
+---------------------------------------------
++ 第三个细节就是memory ordering
+  + 假设我们先通过将locked字段设置为1来获取锁，之后对x加1，最后再将locked字段设置0来释放锁
+  + 但是编译器或者处理器可能会重排指令以获得更好的性能
+  + 对于上面的串行指令流，如果将x <- x+1移到locked<-0之后可以吗？这会改变指令流的正确性吗？
+    + 并不会，因为x和锁完全相互独立，它们之间没有任何关联
+    + 如果他们还是按照串行的方式执行，x <- x+1移到锁之外也没有问题
+    + 所以在一个串行执行的场景下是没有问题的
+  + 实际中，处理器在执行指令时，实际指令的执行顺序可能会改变
+  + 编译器也会做类似的事情，编译器可能会在不改变执行结果的前提下，优化掉一些代码路径并进而改变指令的顺序
++ 但是对于并发执行，很明显这将会是一个灾难
+  + 如果我们将critical section与加锁解锁放在不同的CPU执行，将会得到完全错误的结果
+  + 所以指令重新排序在并发场景是错误的
++ 为了禁止，或者说为了告诉编译器和硬件不要这样做
+  + 我们需要使用memory fence或者叫做synchronize指令，来确定指令的移动范围
+  + 对于synchronize指令，任何在它之前的load/store指令，都不能移动到它之后
+  + 锁的acquire和release函数都包含了synchronize指令
++ 这样前面的例子中，x <- x+1就不会被移到特定的memory synchronization点之外
+  + 我们也就不会有memory ordering带来的问题
+  + 这就是为什么在acquire和release中都有__sync_synchronize函数的调用
 
 
 
