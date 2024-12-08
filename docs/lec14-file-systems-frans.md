@@ -270,47 +270,274 @@ main(int argc, char *argv[]){
 ## XV6创建inode代码展示
 sysfile.c中包含了所有与文件系统相关的函数，分配inode发生在sys_open函数中，这个函数会负责创建文件
 ```c
+uint64
+sys_open(void){
+    char path[MAXPATH];
+    int fd, omode;
+    struct file *f;
+    struct inode *ip;
+    int n;
 
+    if((n =argstr(0,path,MAXPATH))<0| argint(l,&omode)< 0)
+        return -l;
+
+    begin_op();
+    
+    if(omode & O CREATE){
+        ip = create(path,T FILE,0，0);
+        if(ip == ◎){
+            end_op();
+            return -l;
+        }else{
+            if((ip =namei(path))== 0){
+                end_op();
+            }
+        }
+    }
+}
 ```
++ 在sys_open函数中，会调用create函数
+```c
+static struct inode*
+create(char *path, short type, short major, short minor)
+{
+  struct inode *ip, *dp;
+  char name[DIRSIZ];
 
+  if((dp = nameiparent(path, name)) == 0)
+    return 0;
 
+  ilock(dp);
 
+  if((ip = dirlookup(dp, name, 0)) != 0){
+    iunlockput(dp);
+    ilock(ip);
+    if(type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
+      return ip;
+    iunlockput(ip);
+    return 0;
+  }
 
+  if((ip = ialloc(dp->dev, type)) == 0)
+    panic("create: ialloc");
 
+  ilock(ip);
+  ip->major = major;
+  ip->minor = minor;
+  ip->nlink = 1;
+  iupdate(ip);
 
+  if(type == T_DIR){  // Create . and .. entries.
+    dp->nlink++;  // for ".."
+    iupdate(dp);
+    // No ip->nlink++ for ".": avoid cyclic ref count.
+    if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
+      panic("create dots");
+  }
 
+  if(dirlink(dp, name, ip->inum) < 0)
+    panic("create: dirlink");
 
+  iunlockput(dp);
 
+  return ip;
+}
+```
++ create函数中首先会解析路径名并找到最后一个目录，之后会查看文件是否存在，如果存在的话会返回错误
++ 之后就会调用ialloc（inode allocate），这个函数会为文件x分配inode
+  + ialloc函数位于fs.c文件中
+```c
+// Allocate an inode on device dev.
+// Mark it as allocated by  giving it type type.
+// Returns an unlocked but allocated and referenced inode.
+struct inode*
+ialloc(uint dev, short type)
+{
+  int inum;
+  struct buf *bp;
+  struct dinode *dip;
 
+  for(inum = 1; inum < sb.ninodes; inum++){
+    bp = bread(dev, IBLOCK(inum, sb));
+    dip = (struct dinode*)bp->data + inum%IPB;
+    if(dip->type == 0){  // a free inode
+      memset(dip, 0, sizeof(*dip));
+      dip->type = type;
+      log_write(bp);   // mark it allocated on the disk
+      brelse(bp);
+      return iget(dev, inum);
+    }
+    brelse(bp);
+  }
+  panic("ialloc: no inodes");
+}
+```
++ 它会遍历所有可能的inode编号
+  + 找到inode所在的block
+  + 再看位于block中的inode数据的type字段
+    + 如果这是一个空闲的inode，那么将其type字段设置为文件
+    + 这会将inode标记为已被分配
+  + 函数中的log_write就是我们之前看到在console中有关写block的输出
+  + 这里的log_write是我们看到的整个输出的第一个
++ 以上就是第一次写磁盘涉及到的函数调用
++ 如果有多个进程同时调用create函数会发生什么？
+  + 对于一个多核的计算机，进程可能并行运行
+  + 两个进程可能同时会调用到ialloc函数，然后进而调用bread（block read）函数
+  + 所以必须要有一些机制确保这两个进程不会互相影响
++ 让我们看一下位于bio.c的buffer cache代码。首先看一下bread函数
+```c
+// Return a locked buf with the contents of the indicated block.
+struct buf*
+bread(uint dev, uint blockno)
+{
+  struct buf *b;
 
+  b = bget(dev, blockno);
+  if(!b->valid) {
+    virtio_disk_rw(b, 0);
+    b->valid = 1;
+  }
+  return b;
+}
+```
++ bread函数首先会调用bget函数，bget会为我们从buffer cache中找到block的缓存
+```c
+// Look through buffer cache for block on device dev.
+// If not found, allocate a buffer.
+// In either case, return locked buffer.
+static struct buf*
+bget(uint dev, uint blockno)
+{
+  struct buf *b;
 
+  acquire(&bcache.lock);
 
+  // Is the block already cached?
+  for(b = bcache.head.next; b != &bcache.head; b = b->next){
+    if(b->dev == dev && b->blockno == blockno){
+      b->refcnt++;
+      release(&bcache.lock);
+      acquiresleep(&b->lock);
+      return b;
+    }
+  }
 
+  // Not cached.
+  // Recycle the least recently used (LRU) unused buffer.
+  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
+    if(b->refcnt == 0) {
+      b->dev = dev;
+      b->blockno = blockno;
+      b->valid = 0;
+      b->refcnt = 1;
+      release(&bcache.lock);
+      acquiresleep(&b->lock);
+      return b;
+    }
+  }
+  panic("bget: no buffers");
+}
+```
++ 这里遍历了linked-list，来看看现有的cache是否符合要找的block
++ 看一下block 33的cache是否存在
+  + 如果存在的话，将block对象的引用计数（refcnt）加1
+  + 之后再释放bcache锁
+    + 因为现在我们已经完成了对于cache的检查并找到了block cache
+    + 之后，代码会尝试获取block cache的锁
++ 所以，如果有多个进程同时调用bget的话
+  + 其中一个可以获取bcache的锁并扫描buffer cache
+  + 此时，其他进程是没有办法修改buffer cache的（注，因为bacche的锁被占住了）
+  + 之后，进程会查找block number是否在cache中
+    + 如果在的话将block cache的引用计数加1
+    + 表明当前进程对block cache有引用，之后再释放bcache的锁
+  + 如果有第二个进程也想扫描buffer cache
+    + 那么这时它就可以获取bcache的锁
+  + 假设第二个进程也要获取block 33的cache
+    + 那么它也会对相应的block cache的引用计数加1
+    + 最后这两个进程都会尝试对block 33的block cache调用acquiresleep函数
++ acquiresleep是另一种锁，我们称之为sleep lock，本质上来说它获取block 33 cache的锁
+  + 其中一个进程获取锁之后函数返回
+  + 在ialloc函数中会扫描block 33中是否有一个空闲的inode
+  + 而另一个进程会在acquiresleep中等待第一个进程释放锁
 
+## Sleep Lock
++ sleep lock
+```c
+void
+acquiresleep(struct sleeplock *lk){
+    acquire(&lk->lk);
+    while(lk->locked){
+        sleep(lk，&lk->lk);
+    }
+    lk->locked =1;
+    lk->pid =myproc()->pid;
+    release(&lk->lk);
+}
+```
++ 首先是acquiresleep函数，它用来获取sleep lock
+  + 函数里首先获取了一个普通的spinlock，这是与sleep lock关联在一起的一个锁
+  + 之后，如果sleep lock被持有，那么就进入sleep状态，并将自己从当前CPU调度开
++ 既然sleep lock是基于spinlock实现的，为什么对于block cache，我们使用的是sleep lock而不是spinlock？
+  + 对于spinlock有很多限制，其中之一是**加锁时中断必须要关闭**
+  + 所以如果使用spinlock的话，当我们对block cache做操作的时候需要持有锁
+    + 那么我们就永远也不能从磁盘收到数据
+  + 或许另一个CPU核可以收到中断并读到磁盘数据，但是如果我们只有一个CPU核的话，我们就永远也读不到数据了
+  + 出于同样的原因，也**不能在持有spinlock的时候进入sleep状态**
+    + 所以这里我们使用sleep lock
+    + sleep lock的优势就是，我们可以在持有锁的时候不关闭中断
+    + 我们可以在磁盘操作的过程中持有锁，我们也可以长时间持有锁
+    + 当我们在等待sleep lock的时候，我们并没有让CPU一直空转，我们通过sleep将CPU出让出去了
++ 接下来让我们看一下brelease函数
+```c
+// Release a locked buffer
+// Move to the head of the most-recently-used list
+void
+brelse(struct buf *b){
+    if(!holdingsleep(&b->lock))
+        panic("brelse");
 
+    releasesleep(&b->lock);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    acquire(&bcache.lock);
+    b->refcnt--;
+    if(b->refcnt ==0){
+        // no one is waiting for it.
+        b->next->prev = b->prev;
+        b->prev->next=b->next;
+        b->next = bcache.head.next;
+        b->prev = &bcache.head;
+        bcache.head.next->prev = b;
+        bcache.head.next = b;
+    }
+    release(&bcache.lock);
+}
+```
++ brelease函数中首先释放了sleep lock
++ 之后获取了bcache的锁
++ 之后减少了block cache的引用计数，表明一个进程不再对block cache感兴趣
++ 最后如果引用计数为0，那么它会修改buffer cache的linked-list
+  + 将block cache移到linked-list的头部
+  + 这样表示这个block cache是最近使用过的block cache
+    + 这一点很重要，当我们在bget函数中不能找到block cache时
+    + 我们需要在buffer cache中腾出空间来存放新的block cache
+    + 这时会使用LRU（Least Recent Used）算法找出最不常使用的block cache
+    + 并撤回它（注，而将刚刚使用过的block cache放在linked-list的头部就可以直接更新linked-list的tail来完成LRU操作）
++ 为什么这是一个好的策略呢？
+  + 因为通常系统都遵循temporal locality策略
+    + 也就是说如果一个block cache最近被使用过，那么很有可能它很快会再被使用，所以最好不要撤回这样的block cache
++ 以上就是对于block cache代码的介绍。这里有几件事情需要注意：
+  + 首先在内存中，对于一个block只能有一份缓存
+    + 这是block cache必须维护的特性
+  + 其次，这里使用了与之前的spinlock略微不同的sleep lock
+    + 与spinlock不同的是，可以在I/O操作的过程中持有sleep lock
+  + 第三，它采用了LRU作为cache替换策略
+  + 第四，它有两层锁
+    + 第一层锁用来保护buffer cache的内部数据
+    + 第二层锁也就是sleep lock用来保护单个block的cache
+-------------------------------------------
++ 首先，文件系统是一个位于磁盘的数据结构
+  + 我们今天的主要时间都用来介绍这个位于磁盘的数据结构的内容
+  + XV6的这个数据结构实现的很简单，但是你可以实现一个更加复杂的数据结构
++ 其次，我们花了一些时间来看block cache的实现
+  + 这对于性能来说是至关重要的，因为读写磁盘是代价较高的操作，可能要消耗数百毫秒
+  + 而block cache确保了如果我们最近从磁盘读取了一个block，那么我们将不会再从磁盘读取相同的block
