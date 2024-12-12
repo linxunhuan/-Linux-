@@ -90,28 +90,112 @@ $
   + 此后各个CPU需要内存时，如果当前CPU的空闲列表上没有，则窃取其他CPU的
     + 例如，所有的空闲内存初始分配到CPU0，当CPU1需要内存时就会窃取CPU0的
     + 而使用完成后就挂在CPU1的空闲列表，此后CPU1再次需要内存时就可以从自己的空闲列表中取
-### 将kmem定义为一个数组，包含NCPU个元素，即每个CPU对应一个
+### 第一步：修改kmem定义为一个数组，包含NCPU个元素，即每个CPU对应一个
+```c
+struct {
+  struct spinlock lock;
+  struct run *freelist;
+} kmem[NCPU];
+```
+### 第二步：修改kinit
++ 为所有锁初始化以“kmem”开头的名称
++ 该函数只会被一个CPU调用
++ freerange调用kfree将所有空闲内存挂在该CPU的空闲列表上
+```c
+void kinit() {
+  int id;
+
+  // 循环遍历所有 CPU 核心
+  for(id = 0; id < NCPU; id++) {
+    // 为每个 CPU 核心初始化一个锁
+    // 每个锁的名字是 "kmem"，并将其绑定到 kmem[id].lock
+    initlock(&kmem[id].lock, "kmem");
+  }
+
+  freerange(end, (void*)PHYSTOP);
+}
+```
+### 第三步：修改kfree
++ 使用cpuid()和它返回的结果时必须关中断（题目里的提示）
+```c
+void kfree(void *pa)
+{
+  struct run *r;
+
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    panic("kfree"); 
 
 
+  memset(pa, 1, PGSIZE);
 
+  r = (struct run*)pa;
 
+  push_off(); // 关闭中断，防止在修改 freelist 时发生中断，保证操作的原子性
 
+ 
+  int cpu_id = cpuid();
 
+  // 锁住当前 CPU 的内存管理数据结构，防止并发访问导致错误
+  acquire(&kmem[cpu_id].lock);
 
+  // 将当前释放的内存页（r）添加到对应 CPU 的空闲内存链表中
+  r->next = kmem[cpu_id].freelist;  // 将 freelist 的第一个元素指向当前释放的页
+  kmem[cpu_id].freelist = r;        // 更新 freelist 为当前页，表示它是空闲的第一个页
 
+  // 解锁当前 CPU 的内存管理数据结构
+  release(&kmem[cpu_id].lock);
 
+  pop_off();  // 恢复中断，允许中断发生
+}
+```
+### 第四步：修改kalloc
++ 使得在当前CPU的空闲列表没有可分配内存时窃取其他内存的
+```c
+void *
+kalloc(void)
+{
+  struct run *r; 
 
+  push_off();
+  int cpu_id = cpuid();  
+  acquire(&kmem[cpu_id].lock);  // 获取当前 CPU 的内存池锁，以保护对 freelist 的操作
 
+  // 尝试从当前 CPU 的内存池中获取一个空闲内存页
+  r = kmem[cpu_id].freelist;
+  if(r) {
+    // 如果当前 CPU 有空闲内存页，更新 freelist，指向下一个空闲页
+    kmem[cpu_id].freelist = r->next;
+  } else {
+    // 如果当前 CPU 没有空闲内存页，尝试从其他 CPU 的内存池中借一个
+    int antid;  //用于遍历其他 CPU 的内存池
+    for(antid = 0; antid < NCPU; antid++) {
+      if(antid == cpu_id) {
+        continue;  // 跳过当前 CPU 的内存池，已经在上面处理过
+      }
+      acquire(&kmem[antid].lock);  // 获取其他 CPU 内存池的锁
 
+      // 尝试从该 CPU 的内存池中获取一个空闲页
+      r = kmem[antid].freelist;
+      if(r) {
+        // 如果找到了空闲页，更新 freelist，并释放该 CPU 的锁
+        kmem[antid].freelist = r->next;
+        release(&kmem[antid].lock);
+        break;  // 找到一个空闲页后，跳出循环
+      }
+      release(&kmem[antid].lock);  // 如果没有找到空闲页，释放锁并继续遍历其他 CPU
+    }
+  }
 
+  release(&kmem[cpu_id].lock); 
+  pop_off(); 
 
-
-
-
-
-
-
-
-
-
-
+  if(r) {
+    memset((char*)r, 5, PGSIZE);  
+  }
+  return (void*)r;  
+}
+```
+## 测试结果
+<img src=".\picture\image4.png">
+<img src=".\picture\image5.png">
+<img src=".\picture\image6.png">
