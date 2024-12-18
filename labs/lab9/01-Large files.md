@@ -29,12 +29,12 @@ nmeta 70 (boot, super, log blocks 30 inode blocks 13, bitmap blocks 25) blocks 1
 + 您对NDIRECT、 NINDIRECT、MAXFILE以及struct dinode的addrs[]元素特别感兴趣
 + 查看 xv6 文本中的图 8.3，了解标准 xv6 inode 的图表
 + 在磁盘上查找文件数据的代码位于fs.c 中的bmap()中
-+ 查看它并确保你理解它在做什么
-+ 读取和写入文件时都会调用bmap() 
-+ 写入时， bmap()会根据需要分配新块来保存文件内容，并在需要时分配间接块来保存块地址
-+ bmap()处理两种块号
-  + bn 参数是“逻辑块号”——文件内的块号，相对于文件开头
-  + ip- >addrs[]中的块号和bread()的参数是磁盘块号
+  + 查看它并确保你理解它在做什么
+  + 读取和写入文件时都会调用bmap() 
+  + 写入时， bmap()会根据需要分配新块来保存文件内容，并在需要时分配间接块来保存块地址
+  + bmap()处理两种块号
+    + bn 参数是“逻辑块号”——文件内的块号，相对于文件开头
+    + ip- >addrs[]中的块号和bread()的参数是磁盘块号
   + 您可以将bmap ()视为将文件的逻辑块号映射到磁盘块号
 ### 你的工作
 + 修改bmap()，使其除了直接块和单间接块之外，还实现双间接块
@@ -70,49 +70,79 @@ $
 + 您应该仅根据需要分配间接块和双重间接块，就像原始的bmap()一样
 + 确保itrunc释放文件的所有块，包括双重间接块
 ## 解题步骤
-### 第一步：在fs.h中添加宏定义
-```c
-// NDIRECT 定义了直接地址的数量，通常用于索引文件的直接块。
-// 在此示例中，假设每个文件的 inode 中最多有 11 个直接指向数据块的地址。
-#define NDIRECT 11
++ xv6 文件系统中的每一个 inode 结构体中，采用了混合索引的方式记录数据的所在具体盘块号
++ 每个文件所占用的前 12 个盘块的盘块号是直接记录在 inode 中的（每个盘块 1024 字节）
+  + 所以对于任何文件的前 12 KB 数据，都可以通过访问 inode 直接得到盘块号
+  + 这一部分称为直接记录盘块
++ 对于大于 12 个盘块的文件
+  + 大于 12 个盘块的部分，会分配一个额外的一级索引表（一盘块大小，1024Byte）
+  + 用于存储这部分数据的所在盘块号
++ 由于一级索引表可以包含 BSIZE(1024) / 4 = 256 个盘块号
+  + 加上 inode 中的 12 个盘块号
+  + 一个文件最多可以使用 12+256 = 268 个盘块，也就是 268KB
++ inode 结构（含有 NDIRECT=12 个直接记录盘块，还有一个一级索引盘块
+  + 后者又可额外包含 256 个盘块号
+<img src=".\picture\image3.png">
 
-// NINDIRECT 定义了间接地址的数量。
-// 间接地址是指一个数据块存储多个地址，每个地址指向另一个数据块。 
-// BSIZE 是每个数据块的大小，sizeof(uint) 是单个地址的大小。
-// 因此，NINDIRECT 计算的是一个数据块中能够存储多少个指向其他数据块的地址。
-#define NINDIRECT (BSIZE / sizeof(uint))
-
-// NDINDIRECT 定义了二级间接地址的数量。
-// 二级间接地址是指一个数据块存储指向另一个间接地址块的地址。
-// 每个二级间接地址块中存储 NINDIRECT 个地址，因此 NDINDIRECT 是 NINDIRECT 的平方。
-#define NDINDIRECT ((BSIZE / sizeof(uint)) * (BSIZE / sizeof(uint)))
-
-// MAXFILE 定义了一个文件中最多可以有多少个数据块。
-// 这是一个包含直接地址、一级间接地址和二级间接地址的总数。
-// 直接地址是 NDIRECT，一级间接地址是 NINDIRECT，二级间接地址是 NDINDIRECT。
-#define MAXFILE (NDIRECT + NINDIRECT + NDINDIRECT)
-
-// NADDR_PER_BLOCK 定义了每个数据块中可以存储多少个地址。
-// 每个数据块的大小是 BSIZE，单个地址的大小是 sizeof(uint)，
-// 因此一个数据块可以存储 BSIZE / sizeof(uint) 个地址。
-#define NADDR_PER_BLOCK (BSIZE / sizeof(uint))  // 一个块中的地址数量
-```
-### 第二步：由于NDIRECT定义改变，其中一个直接块变为了二级间接块，需要修改inode结构体中addrs元素数量
++ 本 lab 的目标是通过为混合索引机制添加二级索引页，来扩大能够支持的最大文件大小
++ 在我们修改代码之前，xv6的文件系统限制为12个直接块和1个一级间接块
+  + 最大文件大小为(12+256)*1024字节
++ 我们需要实现的是，将1个直接块替换为1个二级间接块
+  + 其中，二级间接块的意思是，该块中存储256个一级简接块的块号
+  + 也就是说，最大文件大小变为(11+256+256*256)*1024字节
+----------------------------------
+前三步的操作，其实对应了题目中的这两句：
++ 磁盘上的 inode 格式由fs.h 中的struct dinode定义
++ 您对NDIRECT、 NINDIRECT、MAXFILE以及struct dinode的addrs[]元素特别感兴趣
+### 第一步:修改NDIRECT
 ```c
 // fs.h
+#define NDIRECT 11
+#define NINDIRECT (BSIZE / sizeof(uint))
+#define MAXFILE (NDIRECT + NINDIRECT + NINDIRECT * NINDIRECT)
+```
+### 第二步：修改dinode结构体
+```c
 struct dinode {
-  ...
-  uint addrs[NDIRECT + 2];   // Data block addresses
-};
-
-// file.h
-struct inode {
-  ...
-  uint addrs[NDIRECT + 2];
+  short type;           // File type
+  short major;          // Major device number (T_DEVICE only)
+  short minor;          // Minor device number (T_DEVICE only)
+  short nlink;          // Number of links to inode in file system
+  uint size;            // Size of file (bytes)
+  uint addrs[NDIRECT+2];   // Data block addresses
 };
 ```
-### 第三步：修改bmap支持二级索引
+### 第三步：修改indoe结构体
 ```c
+// in-memory copy of an inode
+struct inode {
+  uint dev;           // Device number
+  uint inum;          // Inode number
+  int ref;            // Reference count
+  struct sleeplock lock; // protects everything below here
+  int valid;          // inode has been read from disk?
+
+  short type;         // copy of disk inode
+  short major;
+  short minor;
+  short nlink;
+  uint size;
+  uint addrs[NDIRECT+2];
+};
+```
+### 第四步：修改bmap函数
++ 参考一级间接块的处理方案:
+  + 首先需要判断当前请求的文件块是第几块
+    + 如果是二级间接块的话，那么需要获取两个偏移量
+      + 分别是二级间接块的偏移量（bn / NINDIRECT1）
+      + 该偏移量所指向一级间接块的偏移量（bn % NINDIRECT1）
+    + 然后先看二级间接块是否存在，不存在则分配，并跑到对应的一级间接块中
+    + 查看一级间接块是否存在，不存在则分配，最后跑到目标块中
+    + 查看目标块是否存在，不存在则分配
+```c
+
+//  bn 参数是“逻辑块号”——文件内的块号，相对于文件开头
+//  ip- >addrs[]中的块号和bread()的参数是磁盘块号
 static uint
 bmap(struct inode *ip, uint bn)
 {
@@ -120,38 +150,61 @@ bmap(struct inode *ip, uint bn)
   struct buf *bp;
 
   if(bn < NDIRECT){
-    ...
+    if((addr = ip->addrs[bn]) == 0)
+      ip->addrs[bn] = addr = balloc(ip->dev);
+    return addr;
   }
   bn -= NDIRECT;
 
   if(bn < NINDIRECT){
-    ...
-  }
-  bn -= NINDIRECT;
+     // 检查 inode 中是否已经分配了单级间接块。如果没有分配，则分配一个新的间接块
+    if((addr = ip->addrs[NDIRECT]) == 0)
+      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
 
-  // 二级间接块的情况
-  if(bn < NDINDIRECT) {
-    int level2_idx = bn / NADDR_PER_BLOCK;  // 要查找的块号位于二级间接块中的位置
-    int level1_idx = bn % NADDR_PER_BLOCK;  // 要查找的块号位于一级间接块中的位置
-    // 读出二级间接块
-    if((addr = ip->addrs[NDIRECT + 1]) == 0)
-      ip->addrs[NDIRECT + 1] = addr = balloc(ip->dev);
+    // 从磁盘中读取该间接块的数据（包含指向数据块的地址）
     bp = bread(ip->dev, addr);
-    a = (uint*)bp->data;
+    a = (uint*)bp->data;// 将间接块数据转换为地址数组
 
-    if((addr = a[level2_idx]) == 0) {
-      a[level2_idx] = addr = balloc(ip->dev);
-      // 更改了当前块的内容，标记以供后续写回磁盘
+    // 检查间接块中的指定位置（a[bn]）是否已经分配了数据块
+    if((addr = a[bn]) == 0){
+      a[bn] = addr = balloc(ip->dev);
       log_write(bp);
     }
     brelse(bp);
+    return addr;
+  }
 
+  // 如果逻辑块号 bn 大于等于 NINDIRECT，则进入双级间接块映射（doubly-indirect）。
+  bn -= NINDIRECT;  // 减去单级间接块的偏移量，计算出双级间接映射中的偏移位置
+  if(bn < NINDIRECT * NINDIRECT){
+
+    // 检查 inode 中是否已经分配了双级间接块。如果没有分配，则分配一个新的双级间接块
+    if((addr = ip->addrs[NDIRECT + 1]) == 0)
+      ip->addrs[NINDIRECT + 1] = addr = balloc(ip->dev);
+
+
+    // 从磁盘中读取该双级间接块（该块包含指向单级间接块的地址）
     bp = bread(ip->dev, addr);
     a = (uint*)bp->data;
-    if((addr = a[level1_idx]) == 0) {
-      a[level1_idx] = addr = balloc(ip->dev);
+
+    // 再次检查双级间接块中的指定位置（a[bn/NINDIRECT]）是否已经分配了数据块
+    if((addr = a[bn / NINDIRECT]) == 0){
+      a[bn / NINDIRECT] = addr = balloc(ip->dev);
       log_write(bp);
     }
+    brelse(bp);       // 释放缓冲区，不再需要该双级间接块
+    bn %= NINDIRECT;  // 计算出单级间接块中的偏移位置
+
+    // 从磁盘中读取该单级间接块的数据（包含指向数据块的地址）
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+
+    // 检查单级间接块中的指定位置（a[bn]）是否已经分配了数据块
+    if((addr = a[bn]) == 0){
+      a[bn] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+
     brelse(bp);
     return addr;
   }
@@ -159,7 +212,8 @@ bmap(struct inode *ip, uint bn)
   panic("bmap: out of range");
 }
 ```
-### 第四步：修改itrunc释放所有块
+### 第五步：修改itrunc函数
++ 题目里面说的：确保itrunc释放文件的所有块，包括双重间接块
 ```c
 void
 itrunc(struct inode *ip)
@@ -168,97 +222,51 @@ itrunc(struct inode *ip)
   struct buf *bp;
   uint *a;
 
+ // 1. 释放 inode 中的直接块 (NDIRECT)
   for(i = 0; i < NDIRECT; i++){
-    ...
+    if(ip->addrs[i]){
+      bfree(ip->dev, ip->addrs[i]);
+      ip->addrs[i] = 0;
+    }
   }
 
+// 2. 释放 inode 中的间接块 (NDIRECT)
   if(ip->addrs[NDIRECT]){
-    ...
-  }
-
-  struct buf* bp1;
-  uint* a1;
-  if(ip->addrs[NDIRECT + 1]) {
-    bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
+    bp = bread(ip->dev, ip->addrs[NDIRECT]);
     a = (uint*)bp->data;
-    for(i = 0; i < NADDR_PER_BLOCK; i++) {
-      // 每个一级间接块的操作都类似于上面的
-      // if(ip->addrs[NDIRECT])中的内容
-      if(a[i]) {
-        bp1 = bread(ip->dev, a[i]);
-        a1 = (uint*)bp1->data;
-        for(j = 0; j < NADDR_PER_BLOCK; j++) {
-          if(a1[j])
-            bfree(ip->dev, a1[j]);
-        }
-        brelse(bp1);
-        bfree(ip->dev, a[i]);
-      }
+    for(j = 0; j < NINDIRECT; j++){
+      if(a[j])
+        bfree(ip->dev, a[j]);
     }
     brelse(bp);
-    bfree(ip->dev, ip->addrs[NDIRECT + 1]);
-    ip->addrs[NDIRECT + 1] = 0;
+    bfree(ip->dev, ip->addrs[NDIRECT]);
+    ip->addrs[NDIRECT] = 0;
+  }
+
+ // 3. 释放 inode 中的双重间接块 (NDIRECT+1)
+  if(ip->addrs[NDIRECT + 1]){
+    bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
+    a = (uint*)bp->data;
+    for(j = 0; j < NINDIRECT; j++){
+      if(a[j]){
+        struct buf *bp2 = bread(ip->dev, a[j]);
+        uint *a2 = (uint*)bp2->data;
+
+        for(int k = 0; k < NINDIRECT; k++){
+          if(a2[k]){
+            bfree(ip->dev, a2[k]);
+          }  
+        }
+      brelse(bp2);  // 释放一级间接块的缓冲区
+      bfree(ip->dev, a[j]);  // 释放一级间接块
+      }
+    }
+    brelse(bp);                             // 释放二级间接块的缓冲区
+    bfree(ip->dev, ip->addrs[NDIRECT + 1]); // 释放双重间接块本身
+    ip->addrs[NDIRECT + 1] = 0;             // 重置双重间接块
   }
 
   ip->size = 0;
   iupdate(ip);
 }
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
