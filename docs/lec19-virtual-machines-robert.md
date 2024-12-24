@@ -325,18 +325,3 @@ VMM怎么知道Guest当前的mode呢？
     + 但是Guest能够使用的内存地址仍然被EPT所限制，而EPT由VMM所配置
     + 所以Guest只能使用VMM允许其使用的物理内存Page
     + （EPT类似于19.4中的Shadow Page Table）
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
