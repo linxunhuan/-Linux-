@@ -102,32 +102,30 @@ void *mmap(void *addr, size_t length, int prot, int flags,
 + kernel/syscall.c
 <img src=".\picture\image4.png">
 
-### 第二步：跟踪mmap为每个进程映射的内容
-+ 按照题目的提示，定义vma结构体跟踪
+### 第二步：新增lazy_grow_proc函数，用于增长进程空间
+```c
+// kernel/defs.h
+
+int lazy_grow_proc(int n){
+  struct proc *p = myproc();
+  p -> sz = p -> sz + n;
+  return 0;
+}
+```
++ 记得加函数声明
+<img src=".\picture\image5.png">
+
+### 第三步：新增结构体VMA，并且进行初始化、分配、释放
 ```c
 // kernel/proc.h
 
-/*
-跟踪mmap为每个进程映射的内容
-  + 定义一个与第 15 讲中描述的 VMA（虚拟内存区域）相对应的结构
-  + 记录mmap创建的虚拟内存范围的地址、长度、权限、文件等
-  + 由于 xv6 内核中没有内存分配器
-    + 因此可以声明一个固定大小的 VMA 数组并根据需要从该数组中分配
-    + 16 的大小应该足够了
-*/
-#define VMASIZE 16
-
-// 虚拟内存区域 (VMA) 结构体
-struct vma {
-  int valid;          // 是否有效
-  uint64 addr;        // 起始地址   
-  uint64 length;      // 长度
-  int prot;           // 访问权限
-  int flags;          // MAP_SHARED or MAP_PRIVATE
-  struct file *file;  // 关联的文件
-  uint64 offser;      // 文件偏移  
+struct vma{
+  char* addr;
+  uint64 length;
+  char prot;
+  char flags;
+  struct file* file;
 };
-
 
 // Per-process state
 struct proc {
@@ -150,7 +148,54 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
-  struct vma vmas[VMASIZE];
+  struct vma* vma[NOFILE];
 };
 ```
+```c
+struct{
+  struct spinlock lock;
+  struct vma areas[NOFILE];
+}vma_table;
+
+void
+vma_init(void){
+  initlock(&vma_table.lock,"vma_table");
+}
+
+struct vma*
+vma_alloc(void){
+  struct vma* vma;
+
+  acquire(&vma_table.lock);
+  for(vma = vma_table.areas; vma < vma_table.areas + NOFILE; vma++){
+    if(vma -> file == 0){
+      release(&vma_table.lock);
+      return vma;
+    }
+  }
+  release(&vma_table.lock);
+  return 0;
+}
+
+void
+vma_free(struct vma* vma){
+  acquire(&vma_table.lock);
+  vma -> file = 0;
+  release(&vma_table.lock);
+}
+```
++ 下面依然是加入声明，不过这次需要特别在main函数里面加入
+<img src=".\picture\image6.png">
+<img src=".\picture\image7.png">
+
++ 
+
+
+
+
+
+
+
+
+
 
